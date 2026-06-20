@@ -236,7 +236,7 @@ class SchedulingService:
         q = select(Appointment).where(
             and_(
                 Appointment.staff_id == staff_id,
-                Appointment.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
+                Appointment.status.in_([BookingStatus.CONFIRMED.value, BookingStatus.PENDING.value]),
                 or_(
                     and_(Appointment.start_time < end, Appointment.end_time > start),
                 ),
