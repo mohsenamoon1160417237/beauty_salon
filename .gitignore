@@ -1,0 +1,43 @@
+# Environment — NEVER commit real secrets
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Node / n8n
+node_modules/
+.n8n/
+
+# Docker volumes (local data)
+postgres_data/
+redis_data/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# TLS certs (never commit)
+*.pem
+*.key
+*.crt

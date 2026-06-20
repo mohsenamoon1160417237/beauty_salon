@@ -1,0 +1,149 @@
+{
+  "name": "05 - Appointment Reminder System",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 30 }]
+        }
+      },
+      "id": "cron-trigger",
+      "name": "Every 30 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Checks for appointments needing 24h and 1h reminders."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  a.id AS appointment_id,\n  a.calcom_booking_uid,\n  a.start_time,\n  a.timezone,\n  c.phone_number,\n  c.name AS customer_name,\n  c.language_preference,\n  s.name AS service_name,\n  st.name AS staff_name,\n  a.reminder_sent\nFROM appointments a\nJOIN customers c ON a.customer_id = c.id\nJOIN services s ON a.service_id = s.id\nJOIN staff st ON a.staff_id = st.id\nWHERE\n  a.status = 'confirmed'\n  AND a.reminder_sent = false\n  AND (\n    -- 24-hour reminder window\n    (a.start_time BETWEEN NOW() + INTERVAL '23 hours' AND NOW() + INTERVAL '25 hours')\n    OR\n    -- 1-hour reminder window\n    (a.start_time BETWEEN NOW() + INTERVAL '55 minutes' AND NOW() + INTERVAL '65 minutes')\n  )",
+        "additionalFields": {}
+      },
+      "id": "query-reminders",
+      "name": "Query Upcoming Appointments",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "notes": "Finds confirmed appointments in 24h and 1h reminder windows"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.length }}",
+              "operation": "larger",
+              "value2": 0
+            }
+          ]
+        }
+      },
+      "id": "has-reminders",
+      "name": "Any Reminders?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "split-reminders",
+      "name": "Process Each Appointment",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [900, 240]
+    },
+    {
+      "parameters": {
+        "jsCode": "const appt = $input.first().json;\nconst startTime = new Date(appt.start_time);\nconst now = new Date();\nconst diffHours = (startTime - now) / (1000 * 60 * 60);\n\nconst is24h = diffHours >= 23 && diffHours <= 25;\nconst is1h = diffHours >= 0.9 && diffHours <= 1.1;\n\nconst lang = appt.language_preference || 'en';\n\nconst messages = {\n  en: {\n    reminder_24h: `Hi ${appt.customer_name}! 👋\\n\\nReminder: You have a *${appt.service_name}* appointment tomorrow with ${appt.staff_name}.\\n\\n📅 ${startTime.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}\\n⏰ ${startTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: appt.timezone })}\\n\\nNeed to reschedule? Just reply here! 💙`,\n    reminder_1h: `Hi ${appt.customer_name}! ⏰\\n\\nYour *${appt.service_name}* appointment is in *1 hour*!\\n\\nSee you soon at the salon! 💅`\n  },\n  es: {\n    reminder_24h: `¡Hola ${appt.customer_name}! 👋\\n\\nRecordatorio: Tienes una cita de *${appt.service_name}* mañana con ${appt.staff_name}.\\n\\n📅 ${startTime.toLocaleDateString('es', { weekday: 'long', month: 'long', day: 'numeric' })}\\n⏰ ${startTime.toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit', timeZone: appt.timezone })}\\n\\n¿Necesitas reprogramar? ¡Solo responde aquí! 💙`,\n    reminder_1h: `¡Hola ${appt.customer_name}! ⏰\\n\\n¡Tu cita de *${appt.service_name}* es en *1 hora*!\\n\\n¡Nos vemos pronto! 💅`\n  }\n};\n\nconst msgSet = messages[lang] || messages['en'];\nconst messageText = is24h ? msgSet.reminder_24h : (is1h ? msgSet.reminder_1h : null);\n\nif (!messageText) {\n  return [{ json: { skip: true } }];\n}\n\nreturn [{\n  json: {\n    ...appt,\n    message: messageText,\n    reminder_type: is24h ? '24h' : '1h'\n  }\n}];"
+      },
+      "id": "build-reminder",
+      "name": "Build Reminder Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 240]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            { "value1": "={{ $json.skip }}", "value2": false }
+          ]
+        }
+      },
+      "id": "skip-check",
+      "name": "Skip?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1340, 240]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $json.phone_number }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"{{ $json.message }}\"\n  }\n}",
+        "options": {
+          "headers": {
+            "parameter": [
+              { "name": "Authorization", "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}" }
+            ]
+          }
+        }
+      },
+      "id": "send-reminder",
+      "name": "Send Reminder via WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 200]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "table": "appointments",
+        "updateKey": "id",
+        "columns": "reminder_sent",
+        "additionalFields": {}
+      },
+      "id": "mark-sent",
+      "name": "Mark Reminder Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1780, 200],
+      "notes": "Prevents duplicate reminders by setting reminder_sent=true"
+    }
+  ],
+  "connections": {
+    "Every 30 Minutes": {
+      "main": [[{ "node": "Query Upcoming Appointments", "type": "main", "index": 0 }]]
+    },
+    "Query Upcoming Appointments": {
+      "main": [[{ "node": "Any Reminders?", "type": "main", "index": 0 }]]
+    },
+    "Any Reminders?": {
+      "main": [[{ "node": "Process Each Appointment", "type": "main", "index": 0 }], []]
+    },
+    "Process Each Appointment": {
+      "main": [[{ "node": "Build Reminder Message", "type": "main", "index": 0 }]]
+    },
+    "Build Reminder Message": {
+      "main": [[{ "node": "Skip?", "type": "main", "index": 0 }]]
+    },
+    "Skip?": {
+      "main": [[{ "node": "Send Reminder via WhatsApp", "type": "main", "index": 0 }], []]
+    },
+    "Send Reminder via WhatsApp": {
+      "main": [[{ "node": "Mark Reminder Sent", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "05-error-handler"
+  }
+}

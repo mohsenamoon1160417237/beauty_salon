@@ -1,0 +1,361 @@
+{
+  "name": "01 - Incoming WhatsApp Messages",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-incoming",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "whatsapp-trigger",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Meta Cloud API sends all messages here. Set this URL in your Meta App webhook config."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.object }}",
+              "value2": "whatsapp_business_account"
+            }
+          ]
+        }
+      },
+      "id": "verify-meta-webhook",
+      "name": "Is Valid Meta Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verify Meta webhook signature (HMAC-SHA256)\nconst crypto = require('crypto');\nconst secret = $env.WHATSAPP_APP_SECRET;\nconst signature = $input.first().headers['x-hub-signature-256'];\nconst body = JSON.stringify($input.first().body);\nconst expected = 'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');\n\nif (signature !== expected) {\n  throw new Error('Invalid webhook signature - possible forgery');\n}\n\n// Extract message details\nconst entry = $input.first().body.entry?.[0];\nconst change = entry?.changes?.[0]?.value;\nconst messages = change?.messages || [];\n\nif (messages.length === 0) {\n  return [{ json: { type: 'no_message' } }];\n}\n\nconst msg = messages[0];\nconst phone = msg.from;\nconst messageId = msg.id;\nconst timestamp = msg.timestamp;\n\nlet text = '';\nlet messageType = msg.type;\n\nif (msg.type === 'text') {\n  text = msg.text?.body || '';\n} else if (msg.type === 'interactive') {\n  // Handle quick reply buttons\n  const reply = msg.interactive;\n  if (reply.type === 'button_reply') {\n    text = reply.button_reply?.id || reply.button_reply?.title || '';\n    messageType = 'button_reply';\n  } else if (reply.type === 'list_reply') {\n    text = reply.list_reply?.id || '';\n    messageType = 'list_reply';\n  }\n} else if (msg.type === 'audio') {\n  // Mark as needs-transcription; n8n pro can handle this via OpenAI Whisper\n  text = '[voice message]';\n}\n\nreturn [{\n  json: {\n    phone,\n    messageId,\n    timestamp,\n    text,\n    messageType,\n    tenantId: $env.TENANT_ID || 'default',\n    businessPhoneId: change?.metadata?.phone_number_id\n  }\n}];"
+      },
+      "id": "parse-message",
+      "name": "Parse & Verify Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 240],
+      "notes": "Verifies HMAC signature and extracts phone, text, messageType from Meta payload"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=conversation:{{ $json.tenantId }}:{{ $json.phone }}",
+        "options": {}
+      },
+      "id": "get-session",
+      "name": "Get Conversation Session",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [900, 240],
+      "notes": "Retrieve existing conversation context. TTL=24h. If none, AI starts fresh."
+    },
+    {
+      "parameters": {
+        "jsCode": "const session = $input.first().json;\nconst message = $('Parse & Verify Message').first().json;\n\n// Merge session with incoming message\nconst context = session.value ? JSON.parse(session.value) : {\n  state: 'greeting',\n  messages: [],\n  collectedData: {},\n  language: 'en',\n  lastActivity: null\n};\n\n// Append new message to context window (keep last 20 messages)\ncontext.messages.push({\n  role: 'user',\n  content: message.text,\n  timestamp: message.timestamp\n});\nif (context.messages.length > 20) {\n  context.messages = context.messages.slice(-20);\n}\n\ncontext.phone = message.phone;\ncontext.tenantId = message.tenantId;\ncontext.lastActivity = new Date().toISOString();\n\nreturn [{ json: { context, message } }];"
+      },
+      "id": "merge-context",
+      "name": "Merge Session Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 240]
+    },
+    {
+      "parameters": {
+        "model": "claude-sonnet-4-6",
+        "options": {
+          "maxTokens": 2048,
+          "temperature": 0.3,
+          "systemMessage": "You are an expert beauty salon booking assistant for {{ $env.SALON_NAME }}. Your job is to help customers book, reschedule, and cancel appointments.\n\nYou must:\n1. Always be warm, professional, and concise.\n2. Support multilingual conversations — detect and match the customer's language.\n3. Extract: service wanted, preferred date, preferred time, staff preference.\n4. NEVER invent availability — always call check_availability first.\n5. NEVER book directly — always call book_appointment after the customer confirms.\n6. If you cannot help, escalate with escalate_to_human.\n7. Keep responses short and WhatsApp-friendly (use emoji sparingly).\n\nServices available: Haircut (30min), Hair Coloring (120min), Hair Styling (60min), Nail Services (45min), Facial Treatment (60min), Eyebrow Services (30min), Makeup (60min).\n\nCurrent conversation state: {{ $json.context.state }}\nCollected data so far: {{ JSON.stringify($json.context.collectedData) }}"
+        },
+        "tools": [
+          {
+            "name": "check_availability",
+            "description": "Check available appointment slots for a service. Call this BEFORE presenting options to the customer.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "service_id": { "type": "string", "description": "UUID of the service" },
+                "date_from": { "type": "string", "description": "ISO 8601 start of search window" },
+                "date_to": { "type": "string", "description": "ISO 8601 end of search window" },
+                "timezone": { "type": "string", "description": "Customer timezone e.g. America/New_York" },
+                "staff_id": { "type": "string", "description": "Optional staff UUID preference" }
+              },
+              "required": ["service_id", "date_from", "date_to", "timezone"]
+            }
+          },
+          {
+            "name": "book_appointment",
+            "description": "Book an appointment after customer confirms all details. Only call after customer explicit confirmation.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "service_id": { "type": "string" },
+                "staff_id": { "type": "string" },
+                "start_time": { "type": "string", "description": "ISO 8601 datetime" },
+                "timezone": { "type": "string" },
+                "customer_name": { "type": "string" },
+                "customer_phone": { "type": "string" },
+                "notes": { "type": "string" }
+              },
+              "required": ["service_id", "staff_id", "start_time", "timezone", "customer_name", "customer_phone"]
+            }
+          },
+          {
+            "name": "get_appointment",
+            "description": "Look up an existing appointment by customer phone number.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "customer_phone": { "type": "string" }
+              },
+              "required": ["customer_phone"]
+            }
+          },
+          {
+            "name": "reschedule_appointment",
+            "description": "Reschedule an existing appointment to a new time.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "appointment_id": { "type": "string" },
+                "new_start_time": { "type": "string" },
+                "timezone": { "type": "string" },
+                "reason": { "type": "string" }
+              },
+              "required": ["appointment_id", "new_start_time", "timezone"]
+            }
+          },
+          {
+            "name": "cancel_appointment",
+            "description": "Cancel an existing appointment.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "appointment_id": { "type": "string" },
+                "customer_phone": { "type": "string" },
+                "reason": { "type": "string" }
+              },
+              "required": ["appointment_id", "customer_phone"]
+            }
+          },
+          {
+            "name": "get_service_info",
+            "description": "Get list of available services with pricing and duration.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "tenant_id": { "type": "string" }
+              },
+              "required": ["tenant_id"]
+            }
+          },
+          {
+            "name": "escalate_to_human",
+            "description": "Escalate conversation to a human agent when you cannot help.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "reason": { "type": "string" },
+                "summary": { "type": "string", "description": "Brief summary for the human agent" }
+              },
+              "required": ["reason", "summary"]
+            }
+          }
+        ]
+      },
+      "id": "ai-agent",
+      "name": "AI Booking Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1,
+      "position": [1340, 240],
+      "notes": "Claude handles NLU, context tracking, and tool orchestration. Temperature=0.3 for consistency."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.tool_name }}",
+              "value2": "check_availability"
+            }
+          ]
+        }
+      },
+      "id": "route-tool-call",
+      "name": "Route Tool Call",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [1560, 240],
+      "notes": "Routes AI tool calls to the appropriate Python service endpoint"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SCHEDULING_SERVICE_URL }}/api/v1/availability",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "tenant_id", "value": "={{ $json.tool_args.tenant_id || $env.TENANT_ID }}" },
+            { "name": "service_id", "value": "={{ $json.tool_args.service_id }}" },
+            { "name": "date_from", "value": "={{ $json.tool_args.date_from }}" },
+            { "name": "date_to", "value": "={{ $json.tool_args.date_to }}" },
+            { "name": "timezone", "value": "={{ $json.tool_args.timezone }}" }
+          ]
+        }
+      },
+      "id": "call-availability",
+      "name": "Call Availability API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 140]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCHEDULING_SERVICE_URL }}/api/v1/book",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={{ JSON.stringify({ ...($json.tool_args), tenant_id: $env.TENANT_ID }) }}"
+      },
+      "id": "call-book",
+      "name": "Call Booking API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCHEDULING_SERVICE_URL }}/api/v1/reschedule",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={{ JSON.stringify($json.tool_args) }}"
+      },
+      "id": "call-reschedule",
+      "name": "Call Reschedule API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 420]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCHEDULING_SERVICE_URL }}/api/v1/cancel",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={{ JSON.stringify($json.tool_args) }}"
+      },
+      "id": "call-cancel",
+      "name": "Call Cancel API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 560]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WHATSAPP_API_URL }}/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $('Parse & Verify Message').first().json.phone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"{{ $json.ai_response }}\"\n  }\n}"
+      },
+      "id": "send-whatsapp",
+      "name": "Send WhatsApp Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2200, 300],
+      "notes": "Meta Cloud API send message endpoint. Token from env var."
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=conversation:{{ $json.context.tenantId }}:{{ $json.context.phone }}",
+        "value": "={{ JSON.stringify($json.context) }}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 86400
+      },
+      "id": "save-session",
+      "name": "Save Session (24h TTL)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2000, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "OK",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-200",
+      "name": "Respond 200 to Meta",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [460, 460],
+      "notes": "Meta requires 200 within 15s or will retry. Always respond quickly."
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": {
+      "main": [[{ "node": "Is Valid Meta Event?", "type": "main", "index": 0 }]]
+    },
+    "Is Valid Meta Event?": {
+      "main": [
+        [{ "node": "Parse & Verify Message", "type": "main", "index": 0 }],
+        [{ "node": "Respond 200 to Meta", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse & Verify Message": {
+      "main": [[{ "node": "Get Conversation Session", "type": "main", "index": 0 }]]
+    },
+    "Get Conversation Session": {
+      "main": [[{ "node": "Merge Session Context", "type": "main", "index": 0 }]]
+    },
+    "Merge Session Context": {
+      "main": [[{ "node": "AI Booking Agent", "type": "main", "index": 0 }]]
+    },
+    "AI Booking Agent": {
+      "main": [[{ "node": "Route Tool Call", "type": "main", "index": 0 }]]
+    },
+    "Route Tool Call": {
+      "main": [
+        [{ "node": "Call Availability API", "type": "main", "index": 0 }],
+        [{ "node": "Call Booking API", "type": "main", "index": 0 }],
+        [{ "node": "Call Reschedule API", "type": "main", "index": 0 }],
+        [{ "node": "Call Cancel API", "type": "main", "index": 0 }]
+      ]
+    },
+    "Call Availability API": {
+      "main": [[{ "node": "Save Session (24h TTL)", "type": "main", "index": 0 }]]
+    },
+    "Call Booking API": {
+      "main": [[{ "node": "Save Session (24h TTL)", "type": "main", "index": 0 }]]
+    },
+    "Call Reschedule API": {
+      "main": [[{ "node": "Save Session (24h TTL)", "type": "main", "index": 0 }]]
+    },
+    "Call Cancel API": {
+      "main": [[{ "node": "Save Session (24h TTL)", "type": "main", "index": 0 }]]
+    },
+    "Save Session (24h TTL)": {
+      "main": [[{ "node": "Send WhatsApp Reply", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "05-error-handler"
+  }
+}
