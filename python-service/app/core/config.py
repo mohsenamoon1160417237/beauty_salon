@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     WHATSAPP_PHONE_NUMBER_ID: str
     WHATSAPP_ACCESS_TOKEN: str
     WHATSAPP_VERIFY_TOKEN: str
-    WHATSAPP_BUSINESS_ACCOUNT_ID: str
+    WHATSAPP_BUSINESS_ACCOUNT_ID: Optional[str] = None
 
     # Twilio (fallback)
     TWILIO_ACCOUNT_SID: Optional[str] = None
@@ -46,8 +46,8 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.3
 
     # n8n
-    N8N_WEBHOOK_BASE_URL: str
-    N8N_API_KEY: str
+    N8N_WEBHOOK_BASE_URL: Optional[str] = None
+    N8N_API_KEY: Optional[str] = None
 
     # Scheduling
     DEFAULT_TIMEZONE: str = "America/New_York"
