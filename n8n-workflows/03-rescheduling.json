@@ -1,0 +1,229 @@
+{
+  "name": "03 - Appointment Rescheduling",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "reschedule-request",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "reschedule-trigger",
+      "name": "Reschedule Request Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Called by Workflow 01 when AI agent tool call = reschedule_appointment"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\nconst required = ['appointment_id', 'new_start_time', 'timezone', 'customer_phone'];\nconst missing = required.filter(k => !body[k]);\nif (missing.length > 0) {\n  throw new Error(`Missing fields for reschedule: ${missing.join(', ')}`);\n}\nreturn [{ json: body }];"
+      },
+      "id": "validate-reschedule",
+      "name": "Validate Reschedule Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SCHEDULING_SERVICE_URL }}/api/v1/appointments/{{ $json.appointment_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "response": { "response": { "fullResponse": true } }
+        }
+      },
+      "id": "lookup-appointment",
+      "name": "Look Up Existing Appointment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 300],
+      "notes": "Fetch current appointment details to show customer what they are changing FROM"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.statusCode }}",
+              "operation": "equal",
+              "value2": 200
+            }
+          ]
+        }
+      },
+      "id": "appointment-found",
+      "name": "Appointment Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCHEDULING_SERVICE_URL }}/api/v1/check-conflict",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"staff_id\": \"{{ $('Look Up Existing Appointment').first().json.body.staff_id }}\",\n  \"start_time\": \"{{ $('Validate Reschedule Input').first().json.new_start_time }}\",\n  \"end_time\": \"{{ $('Look Up Existing Appointment').first().json.body.new_end_time }}\",\n  \"exclude_appointment_id\": \"{{ $('Validate Reschedule Input').first().json.appointment_id }}\"\n}"
+      },
+      "id": "check-new-slot",
+      "name": "Check New Slot Availability",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 220],
+      "notes": "exclude_appointment_id prevents the current booking from blocking its own reschedule slot"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.has_conflict }}",
+              "value2": false
+            }
+          ]
+        }
+      },
+      "id": "new-slot-free",
+      "name": "New Slot Free?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1340, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCHEDULING_SERVICE_URL }}/api/v1/reschedule",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"appointment_id\": \"{{ $('Validate Reschedule Input').first().json.appointment_id }}\",\n  \"new_start_time\": \"{{ $('Validate Reschedule Input').first().json.new_start_time }}\",\n  \"timezone\": \"{{ $('Validate Reschedule Input').first().json.timezone }}\",\n  \"reason\": \"{{ $('Validate Reschedule Input').first().json.reason || 'Customer request via WhatsApp' }}\"\n}",
+        "options": {
+          "response": { "response": { "fullResponse": true } }
+        }
+      },
+      "id": "do-reschedule",
+      "name": "Execute Reschedule",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 160],
+      "notes": "Python service acquires Redis lock on new slot, updates Cal.com, updates local DB"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $('Validate Reschedule Input').first().json.customer_phone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"{{ $('Execute Reschedule').first().json.body.confirmation_message }}\"\n  }\n}",
+        "options": {
+          "headers": {
+            "parameter": [
+              { "name": "Authorization", "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}" }
+            ]
+          }
+        }
+      },
+      "id": "send-reschedule-confirm",
+      "name": "Send Reschedule Confirmation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $('Validate Reschedule Input').first().json.customer_phone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"⚠️ That new time is not available. Would you like to see other available slots?\"\n  }\n}",
+        "options": {
+          "headers": {
+            "parameter": [
+              { "name": "Authorization", "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}" }
+            ]
+          }
+        }
+      },
+      "id": "send-slot-unavailable",
+      "name": "Notify New Slot Unavailable",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 340]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $('Validate Reschedule Input').first().json.customer_phone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"❌ We couldn't find your appointment. Please check the reference number or contact us directly.\"\n  }\n}",
+        "options": {
+          "headers": {
+            "parameter": [
+              { "name": "Authorization", "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}" }
+            ]
+          }
+        }
+      },
+      "id": "send-not-found",
+      "name": "Notify Appointment Not Found",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 420]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Execute Reschedule').first().json.body) }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-rescheduled",
+      "name": "Return Rescheduled Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2000, 160]
+    }
+  ],
+  "connections": {
+    "Reschedule Request Trigger": {
+      "main": [[{ "node": "Validate Reschedule Input", "type": "main", "index": 0 }]]
+    },
+    "Validate Reschedule Input": {
+      "main": [[{ "node": "Look Up Existing Appointment", "type": "main", "index": 0 }]]
+    },
+    "Look Up Existing Appointment": {
+      "main": [[{ "node": "Appointment Found?", "type": "main", "index": 0 }]]
+    },
+    "Appointment Found?": {
+      "main": [
+        [{ "node": "Check New Slot Availability", "type": "main", "index": 0 }],
+        [{ "node": "Notify Appointment Not Found", "type": "main", "index": 0 }]
+      ]
+    },
+    "Check New Slot Availability": {
+      "main": [[{ "node": "New Slot Free?", "type": "main", "index": 0 }]]
+    },
+    "New Slot Free?": {
+      "main": [
+        [{ "node": "Execute Reschedule", "type": "main", "index": 0 }],
+        [{ "node": "Notify New Slot Unavailable", "type": "main", "index": 0 }]
+      ]
+    },
+    "Execute Reschedule": {
+      "main": [[{ "node": "Send Reschedule Confirmation", "type": "main", "index": 0 }]]
+    },
+    "Send Reschedule Confirmation": {
+      "main": [[{ "node": "Return Rescheduled Result", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "05-error-handler"
+  }
+}

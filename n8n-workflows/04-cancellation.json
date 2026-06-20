@@ -1,0 +1,221 @@
+{
+  "name": "04 - Appointment Cancellation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cancel-request",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "cancel-trigger",
+      "name": "Cancellation Request Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Called by Workflow 01 when AI agent tool call = cancel_appointment"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\nconst required = ['appointment_id', 'customer_phone'];\nconst missing = required.filter(k => !body[k]);\nif (missing.length > 0) {\n  throw new Error(`Missing fields for cancellation: ${missing.join(', ')}`);\n}\nreturn [{ json: body }];"
+      },
+      "id": "validate-cancel",
+      "name": "Validate Cancellation Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SCHEDULING_SERVICE_URL }}/api/v1/appointments/{{ $json.appointment_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "response": { "response": { "fullResponse": true } }
+        }
+      },
+      "id": "lookup-for-cancel",
+      "name": "Look Up Appointment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.statusCode }}",
+              "operation": "equal",
+              "value2": 200
+            }
+          ]
+        }
+      },
+      "id": "found-for-cancel",
+      "name": "Appointment Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a confirmation prompt before actually cancelling\nconst appt = $('Look Up Appointment').first().json.body;\nconst startTime = new Date(appt.start_time);\n\nconst message = `Are you sure you want to cancel your appointment?\\n\\n` +\n  `📅 ${appt.service_name} with ${appt.staff_name}\\n` +\n  `⏰ ${startTime.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })} at ${startTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}\\n\\n` +\n  `Reply YES to confirm cancellation, or NO to keep your appointment.`;\n\nreturn [{ json: { ...appt, confirm_message: message } }];"
+      },
+      "id": "build-confirm-prompt",
+      "name": "Build Confirmation Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 220],
+      "notes": "Always ask for explicit confirmation before cancelling — avoids accidental cancellations"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $('Validate Cancellation Input').first().json.customer_phone }}\",\n  \"type\": \"interactive\",\n  \"interactive\": {\n    \"type\": \"button\",\n    \"body\": { \"text\": \"{{ $json.confirm_message }}\" },\n    \"action\": {\n      \"buttons\": [\n        { \"type\": \"reply\", \"reply\": { \"id\": \"CONFIRM_CANCEL\", \"title\": \"Yes, Cancel\" } },\n        { \"type\": \"reply\", \"reply\": { \"id\": \"KEEP_APPOINTMENT\", \"title\": \"No, Keep It\" } }\n      ]\n    }\n  }\n}",
+        "options": {
+          "headers": {
+            "parameter": [
+              { "name": "Authorization", "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}" }
+            ]
+          }
+        }
+      },
+      "id": "send-confirm-prompt",
+      "name": "Send Cancel Confirmation Prompt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 220],
+      "notes": "Uses WhatsApp interactive buttons — customer taps Yes/No instead of typing"
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=pending_cancel:{{ $('Validate Cancellation Input').first().json.customer_phone }}",
+        "value": "={{ $('Validate Cancellation Input').first().json.appointment_id }}",
+        "expire": true,
+        "ttl": 300
+      },
+      "id": "store-pending-cancel",
+      "name": "Store Pending Cancel (5min TTL)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1560, 220],
+      "notes": "Stores appointment_id keyed by phone. Workflow 01 checks this when customer replies YES/NO."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCHEDULING_SERVICE_URL }}/api/v1/cancel",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"appointment_id\": \"{{ $('Validate Cancellation Input').first().json.appointment_id }}\",\n  \"customer_phone\": \"{{ $('Validate Cancellation Input').first().json.customer_phone }}\",\n  \"reason\": \"{{ $('Validate Cancellation Input').first().json.reason || 'Customer request via WhatsApp' }}\"\n}",
+        "options": {
+          "response": { "response": { "fullResponse": true } }
+        }
+      },
+      "id": "do-cancel",
+      "name": "Execute Cancellation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 220],
+      "notes": "Called after customer confirms YES. Python service cancels in Cal.com and updates local DB."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $('Validate Cancellation Input').first().json.customer_phone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"{{ $('Execute Cancellation').first().json.body.message }}\"\n  }\n}",
+        "options": {
+          "headers": {
+            "parameter": [
+              { "name": "Authorization", "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}" }
+            ]
+          }
+        }
+      },
+      "id": "send-cancel-done",
+      "name": "Send Cancellation Confirmation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2000, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $('Validate Cancellation Input').first().json.customer_phone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"❌ We couldn't find that appointment. Please check your reference number or contact us directly.\"\n  }\n}",
+        "options": {
+          "headers": {
+            "parameter": [
+              { "name": "Authorization", "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}" }
+            ]
+          }
+        }
+      },
+      "id": "send-not-found-cancel",
+      "name": "Notify Not Found",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 420]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"awaiting_confirmation\" }",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-awaiting",
+      "name": "Return Awaiting Confirmation",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1780, 380]
+    }
+  ],
+  "connections": {
+    "Cancellation Request Trigger": {
+      "main": [[{ "node": "Validate Cancellation Input", "type": "main", "index": 0 }]]
+    },
+    "Validate Cancellation Input": {
+      "main": [[{ "node": "Look Up Appointment", "type": "main", "index": 0 }]]
+    },
+    "Look Up Appointment": {
+      "main": [[{ "node": "Appointment Found?", "type": "main", "index": 0 }]]
+    },
+    "Appointment Found?": {
+      "main": [
+        [{ "node": "Build Confirmation Prompt", "type": "main", "index": 0 }],
+        [{ "node": "Notify Not Found", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Confirmation Prompt": {
+      "main": [[{ "node": "Send Cancel Confirmation Prompt", "type": "main", "index": 0 }]]
+    },
+    "Send Cancel Confirmation Prompt": {
+      "main": [[{ "node": "Store Pending Cancel (5min TTL)", "type": "main", "index": 0 }]]
+    },
+    "Store Pending Cancel (5min TTL)": {
+      "main": [[{ "node": "Execute Cancellation", "type": "main", "index": 0 }]]
+    },
+    "Execute Cancellation": {
+      "main": [[{ "node": "Send Cancellation Confirmation", "type": "main", "index": 0 }]]
+    },
+    "Notify Not Found": {
+      "main": [[{ "node": "Return Awaiting Confirmation", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "05-error-handler"
+  }
+}

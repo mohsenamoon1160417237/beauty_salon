@@ -1,0 +1,115 @@
+{
+  "name": "00 - Error Handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "All 5 workflows set errorWorkflow = this workflow. Catches any unhandled exception."
+    },
+    {
+      "parameters": {
+        "jsCode": "const error = $input.first().json;\n\nconst workflowName = error.workflow?.name || 'Unknown workflow';\nconst errorMessage = error.execution?.error?.message || 'Unknown error';\nconst errorStack = error.execution?.error?.stack || '';\nconst executionId = error.execution?.id || '';\nconst node = error.execution?.lastNodeExecuted || '';\n\n// Try to extract customer phone from the failed execution data\nlet customerPhone = null;\ntry {\n  const inputData = error.execution?.data?.executionData?.nodeExecutionStack?.[0]?.data?.main?.[0]?.[0]?.json;\n  customerPhone = inputData?.customer_phone || inputData?.phone || null;\n} catch(e) {}\n\nreturn [{\n  json: {\n    workflowName,\n    errorMessage,\n    errorStack,\n    executionId,\n    node,\n    customerPhone,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "parse-error",
+      "name": "Parse Error Details",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "audit_logs",
+        "columns": "tenant_id,actor_type,action,resource_type,payload",
+        "additionalFields": {}
+      },
+      "id": "log-error",
+      "name": "Log Error to Audit Table",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [680, 300],
+      "notes": "Every error is permanently logged for debugging and GDPR audit trail"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.customerPhone }}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        }
+      },
+      "id": "has-customer-phone",
+      "name": "Customer Phone Known?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $json.customerPhone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"⚠️ Sorry, something went wrong on our end while processing your request. Our team has been notified and will follow up shortly. You can also call us directly to complete your booking.\"\n  }\n}",
+        "options": {
+          "headers": {
+            "parameter": [
+              { "name": "Authorization", "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}" }
+            ]
+          }
+        }
+      },
+      "id": "notify-customer-error",
+      "name": "Notify Customer of Error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 200],
+      "notes": "Customer always gets a response — never left hanging in silence"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"text\": \"🚨 *Salon Booking Agent Error*\",\n  \"attachments\": [{\n    \"color\": \"danger\",\n    \"fields\": [\n      { \"title\": \"Workflow\", \"value\": \"{{ $json.workflowName }}\", \"short\": true },\n      { \"title\": \"Node\", \"value\": \"{{ $json.node }}\", \"short\": true },\n      { \"title\": \"Error\", \"value\": \"{{ $json.errorMessage }}\", \"short\": false },\n      { \"title\": \"Execution ID\", \"value\": \"{{ $json.executionId }}\", \"short\": true },\n      { \"title\": \"Time\", \"value\": \"{{ $json.timestamp }}\", \"short\": true }\n    ]\n  }]\n}"
+      },
+      "id": "alert-slack",
+      "name": "Alert Team on Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 380],
+      "notes": "Optional — remove if not using Slack. Replace with email or PagerDuty as needed."
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [[{ "node": "Parse Error Details", "type": "main", "index": 0 }]]
+    },
+    "Parse Error Details": {
+      "main": [[{ "node": "Log Error to Audit Table", "type": "main", "index": 0 }]]
+    },
+    "Log Error to Audit Table": {
+      "main": [[{ "node": "Customer Phone Known?", "type": "main", "index": 0 }]]
+    },
+    "Customer Phone Known?": {
+      "main": [
+        [{ "node": "Notify Customer of Error", "type": "main", "index": 0 }],
+        [{ "node": "Alert Team on Slack", "type": "main", "index": 0 }]
+      ]
+    },
+    "Notify Customer of Error": {
+      "main": [[{ "node": "Alert Team on Slack", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

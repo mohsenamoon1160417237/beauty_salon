@@ -1,0 +1,228 @@
+{
+  "name": "02 - Appointment Booking",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "booking-request",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "booking-trigger",
+      "name": "Booking Request Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Called by Workflow 01 when AI agent tool call = book_appointment"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate all required fields are present before touching any API\nconst body = $input.first().json;\nconst required = ['service_id','staff_id','start_time','timezone','customer_name','customer_phone','tenant_id'];\nconst missing = required.filter(k => !body[k]);\n\nif (missing.length > 0) {\n  throw new Error(`Missing required booking fields: ${missing.join(', ')}`);\n}\n\n// Normalize phone to E.164\nlet phone = body.customer_phone.replace(/\\s/g, '');\nif (!phone.startsWith('+')) phone = '+' + phone;\n\nreturn [{ json: { ...body, customer_phone: phone } }];"
+      },
+      "id": "validate-input",
+      "name": "Validate & Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCHEDULING_SERVICE_URL }}/api/v1/check-conflict",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"staff_id\": \"{{ $json.staff_id }}\",\n  \"start_time\": \"{{ $json.start_time }}\",\n  \"end_time\": \"{{ $json.end_time }}\"\n}",
+        "options": {
+          "response": { "response": { "fullResponse": true } }
+        }
+      },
+      "id": "check-conflict",
+      "name": "Pre-flight Conflict Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 300],
+      "notes": "Check conflict BEFORE calling Cal.com — saves an API round-trip if slot is gone"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.body.has_conflict }}",
+              "value2": false
+            }
+          ]
+        }
+      },
+      "id": "conflict-gate",
+      "name": "Slot Still Available?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCHEDULING_SERVICE_URL }}/api/v1/book",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={{ JSON.stringify($('Validate & Normalize Input').first().json) }}",
+        "options": {
+          "response": { "response": { "fullResponse": true } }
+        }
+      },
+      "id": "create-booking",
+      "name": "Create Booking (Atomic)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 220],
+      "notes": "Python service acquires Redis lock → re-checks conflict → writes Cal.com → mirrors to DB atomically"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.statusCode }}",
+              "operation": "equal",
+              "value2": 201
+            }
+          ]
+        }
+      },
+      "id": "booking-success-check",
+      "name": "Booking Succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1340, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $('Validate & Normalize Input').first().json.customer_phone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"{{ $('Create Booking (Atomic)').first().json.body.confirmation_message }}\"\n  }\n}",
+        "options": {
+          "headers": {
+            "parameter": [
+              { "name": "Authorization", "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}" }
+            ]
+          }
+        }
+      },
+      "id": "send-confirmation",
+      "name": "Send Confirmation via WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $('Validate & Normalize Input').first().json.customer_phone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"⚠️ Sorry, that time slot was just taken by another customer. Let me check what's still available for you...\"\n  }\n}",
+        "options": {
+          "headers": {
+            "parameter": [
+              { "name": "Authorization", "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}" }
+            ]
+          }
+        }
+      },
+      "id": "send-conflict-message",
+      "name": "Notify Slot Taken",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 420],
+      "notes": "Slot was taken between availability check and booking — rare but must be handled gracefully"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $('Validate & Normalize Input').first().json.customer_phone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"⚠️ Something went wrong while booking. Our team has been notified. Please try again or call us directly.\"\n  }\n}",
+        "options": {
+          "headers": {
+            "parameter": [
+              { "name": "Authorization", "value": "=Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}" }
+            ]
+          }
+        }
+      },
+      "id": "send-error-message",
+      "name": "Notify Booking Error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Create Booking (Atomic)').first().json.body) }}",
+        "options": { "responseCode": 201 }
+      },
+      "id": "respond-success",
+      "name": "Return Booking Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1780, 160]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"error\": \"slot_taken\", \"message\": \"Time slot is no longer available\" }",
+        "options": { "responseCode": 409 }
+      },
+      "id": "respond-conflict",
+      "name": "Return 409 Conflict",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1340, 420]
+    }
+  ],
+  "connections": {
+    "Booking Request Trigger": {
+      "main": [[{ "node": "Validate & Normalize Input", "type": "main", "index": 0 }]]
+    },
+    "Validate & Normalize Input": {
+      "main": [[{ "node": "Pre-flight Conflict Check", "type": "main", "index": 0 }]]
+    },
+    "Pre-flight Conflict Check": {
+      "main": [[{ "node": "Slot Still Available?", "type": "main", "index": 0 }]]
+    },
+    "Slot Still Available?": {
+      "main": [
+        [{ "node": "Create Booking (Atomic)", "type": "main", "index": 0 }],
+        [{ "node": "Notify Slot Taken", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Booking (Atomic)": {
+      "main": [[{ "node": "Booking Succeeded?", "type": "main", "index": 0 }]]
+    },
+    "Booking Succeeded?": {
+      "main": [
+        [{ "node": "Send Confirmation via WhatsApp", "type": "main", "index": 0 }],
+        [{ "node": "Notify Booking Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Confirmation via WhatsApp": {
+      "main": [[{ "node": "Return Booking Result", "type": "main", "index": 0 }]]
+    },
+    "Notify Slot Taken": {
+      "main": [[{ "node": "Return 409 Conflict", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "05-error-handler"
+  }
+}
