@@ -144,7 +144,7 @@ class Appointment(Base):
     start_time = Column(DateTime(timezone=True), nullable=False)
     end_time = Column(DateTime(timezone=True), nullable=False)
     timezone = Column(String(100), nullable=False)
-    status = Column(Enum(BookingStatus), default=BookingStatus.PENDING, nullable=False)
+    status = Column(Enum(BookingStatus, name="booking_status", create_type=False), default=BookingStatus.PENDING, nullable=False)
 
     # Optimistic concurrency control
     version = Column(Integer, default=1, nullable=False)
