@@ -40,8 +40,8 @@ services:
       POSTGRES_MULTIPLE_DATABASES: salon_booking,calcom
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
-      - ./docker/postgres/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/000_init.sh:ro
+      - ../database/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      - ./postgres/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/000_init.sh:ro
     networks: [internal]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-salon} -d salon_booking"]
@@ -189,7 +189,7 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - nginx_certs:/etc/letsencrypt:ro
     depends_on:
       - n8n
