@@ -11,7 +11,6 @@ from app.schemas.booking import (
     ServiceInfo, StaffInfo,
 )
 from app.services.scheduling import SchedulingService
-from app.core.config import settings
 from app.models.booking import Service, Staff
 from sqlalchemy import select, and_
 from typing import List
@@ -21,12 +20,7 @@ router = APIRouter(prefix="/api/v1", tags=["scheduling"])
 
 
 def get_scheduling_service(db: AsyncSession = Depends(get_db)) -> SchedulingService:
-    # In multi-tenant mode this would resolve per-tenant credentials
-    return SchedulingService(
-        db=db,
-        tenant_calcom_url=settings.CALCOM_BASE_URL,
-        tenant_api_key=settings.CALCOM_API_KEY,
-    )
+    return SchedulingService(db=db)
 
 
 @router.get("/availability", response_model=AvailabilityResponse)

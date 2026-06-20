@@ -21,10 +21,10 @@ class Settings(BaseSettings):
     REDIS_URL: RedisDsn
     REDIS_LOCK_TTL: int = 30  # seconds
 
-    # Cal.com (Cal DIY)
-    CALCOM_BASE_URL: str
-    CALCOM_API_KEY: str
-    CALCOM_WEBHOOK_SECRET: str
+    # Cal.com (disabled — standalone mode)
+    CALCOM_BASE_URL: Optional[str] = None
+    CALCOM_API_KEY: Optional[str] = None
+    CALCOM_WEBHOOK_SECRET: Optional[str] = None
 
     # WhatsApp (Meta Cloud API)
     WHATSAPP_PHONE_NUMBER_ID: str

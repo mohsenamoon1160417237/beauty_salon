@@ -1,19 +1,7 @@
 """
-Core scheduling engine.
+Core scheduling engine — standalone mode (no Cal.com dependency).
 
-Concurrency strategy chosen: Distributed Redis lock + DB-level conflict query.
-
-Why not optimistic concurrency (OCC) alone?
-  OCC detects conflicts after the fact and forces a retry. For appointment booking
-  this means the customer sees a retry delay. Under moderate concurrency (10–50 req/s)
-  the lock is faster and gives better UX.
-
-Why not pessimistic DB row lock (SELECT FOR UPDATE) alone?
-  Works only if every write goes through one DB node and one connection pool.
-  In Kubernetes with multiple replicas and connection pooling (PgBouncer), you
-  can have connection-level mismatches. The Redis lock is infrastructure-agnostic.
-
-Combined approach:
+Concurrency strategy:
   1. Acquire Redis slot lock (30s TTL, 5 retries with exponential backoff)
   2. Re-check DB for conflicts inside the lock (eliminates TOCTOU race)
   3. Write to DB atomically inside a transaction
@@ -23,6 +11,7 @@ This gives us: no double bookings, sub-second conflict detection, horizontal sca
 """
 
 import logging
+import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional
 from uuid import UUID
@@ -32,8 +21,6 @@ from sqlalchemy import select, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.redis_client import DistributedLock, slot_lock_key
-from app.core.database import get_db_context
-from app.integrations.calcom import get_calcom_client
 from app.models.booking import (
     Appointment, BookingStatus, Customer, Service, Staff, StaffHoliday
 )
@@ -48,62 +35,46 @@ logger = logging.getLogger(__name__)
 
 class SchedulingService:
 
-    def __init__(self, db: AsyncSession, tenant_calcom_url: str, tenant_api_key: str):
+    def __init__(self, db: AsyncSession):
         self.db = db
-        self.calcom = get_calcom_client(tenant_calcom_url, tenant_api_key)
 
     # ─────────────────────────── Availability ────────────────────────────
 
     async def get_availability(self, req: AvailabilityRequest) -> AvailabilityResponse:
-        """
-        Returns merged availability: Cal.com slots ∩ local staff schedule,
-        minus existing appointments and holidays.
-        """
         service = await self._get_service(req.service_id)
-        if not service or not service.calcom_event_type_id:
-            raise ValueError(f"Service {req.service_id} not found or not configured")
+        if not service:
+            raise ValueError(f"Service {req.service_id} not found")
 
-        # Fetch slots from Cal.com
-        calcom_slots = await self.calcom.get_available_slots(
-            event_type_id=service.calcom_event_type_id,
-            start_time=req.date_from.isoformat(),
-            end_time=req.date_to.isoformat(),
-            timezone=req.timezone,
-        )
-
-        # Build staff filter
-        staff_filter = []
         if req.staff_id:
             staff_list = [await self._get_staff(req.staff_id)]
         else:
-            staff_list = await self._get_staff_for_service(req.service_id, req.tenant_id)
+            staff_list = await self._get_active_staff(req.tenant_id)
 
-        available_slots: List[TimeSlot] = []
         tz = ZoneInfo(req.timezone)
+        available_slots: List[TimeSlot] = []
 
-        for cs in calcom_slots:
-            slot_start = cs.time.astimezone(tz)
-            slot_end = slot_start + timedelta(minutes=service.duration_minutes)
+        # Generate slots every 30 minutes across the requested date range
+        current = req.date_from.astimezone(tz)
+        end_range = req.date_to.astimezone(tz)
+
+        while current < end_range:
+            slot_end = current + timedelta(minutes=service.duration_minutes)
 
             for staff in staff_list:
-                if not staff:
+                if not staff or not staff.is_active:
                     continue
-                # Skip if staff on holiday
-                if await self._is_on_holiday(staff.id, slot_start, slot_end):
+                if await self._is_on_holiday(staff.id, current, slot_end):
                     continue
-                # Skip if conflicts with existing bookings
-                conflict = await self._has_booking_conflict(
-                    staff_id=staff.id,
-                    start=slot_start,
-                    end=slot_end,
-                )
+                conflict = await self._has_booking_conflict(staff.id, current, slot_end)
                 available_slots.append(TimeSlot(
-                    start=slot_start,
+                    start=current,
                     end=slot_end,
                     staff_id=staff.id,
                     staff_name=staff.name,
                     available=not conflict,
                 ))
+
+            current += timedelta(minutes=30)
 
         return AvailabilityResponse(
             slots=[s for s in available_slots if s.available],
@@ -123,18 +94,15 @@ class SchedulingService:
         lock_key = slot_lock_key(str(req.staff_id), req.start_time.isoformat())
 
         async with DistributedLock(lock_key):
-            # Re-check conflict under the lock (eliminates TOCTOU)
             if await self._has_booking_conflict(req.staff_id, req.start_time, end_time):
                 raise ValueError(
                     f"Time slot {req.start_time} is no longer available for {staff.name}"
                 )
 
-            # Check advance booking constraint
             min_advance = timedelta(hours=2)
             if req.start_time - datetime.now(req.start_time.tzinfo) < min_advance:
                 raise ValueError("Appointments must be booked at least 2 hours in advance")
 
-            # Get or create customer
             customer = await self._upsert_customer(
                 tenant_id=req.tenant_id,
                 phone=req.customer_phone,
@@ -143,26 +111,14 @@ class SchedulingService:
                 language=req.language,
             )
 
-            # Create in Cal.com first (source of truth for reminders/calendar)
-            calcom_booking = await self.calcom.create_booking(
-                event_type_id=service.calcom_event_type_id,
-                start=req.start_time.isoformat(),
-                attendee_name=req.customer_name,
-                attendee_email=req.customer_email or f"{req.customer_phone.replace('+', '')}@wa.noreply",
-                attendee_phone=req.customer_phone,
-                timezone=req.timezone,
-                notes=req.notes,
-                language=req.language,
-            )
+            booking_ref = str(uuid.uuid4())[:8].upper()
 
-            # Mirror to local DB
             appointment = Appointment(
                 tenant_id=req.tenant_id,
                 customer_id=customer.id,
                 service_id=req.service_id,
                 staff_id=req.staff_id,
-                calcom_booking_id=calcom_booking.id,
-                calcom_booking_uid=calcom_booking.uid,
+                calcom_booking_uid=booking_ref,
                 start_time=req.start_time,
                 end_time=end_time,
                 timezone=req.timezone,
@@ -174,7 +130,7 @@ class SchedulingService:
 
         return BookingResponse(
             appointment_id=appointment.id,
-            calcom_booking_uid=calcom_booking.uid,
+            calcom_booking_uid=booking_ref,
             customer_name=req.customer_name,
             service_name=service.name,
             staff_name=staff.name,
@@ -186,7 +142,7 @@ class SchedulingService:
                 f"✅ Your {service.name} appointment with {staff.name} is confirmed!\n"
                 f"📅 {req.start_time.strftime('%A, %B %d at %I:%M %p')} ({req.timezone})\n"
                 f"⏱ Duration: {service.duration_minutes} minutes\n"
-                f"Ref: {calcom_booking.uid[:8].upper()}"
+                f"Ref: {booking_ref}"
             ),
         )
 
@@ -206,18 +162,9 @@ class SchedulingService:
 
         async with DistributedLock(lock_key):
             if await self._has_booking_conflict(
-                appointment.staff_id,
-                req.new_start_time,
-                new_end,
-                exclude_id=appointment.id,
+                appointment.staff_id, req.new_start_time, new_end, exclude_id=appointment.id
             ):
                 raise ValueError("New time slot is not available")
-
-            calcom_booking = await self.calcom.reschedule_booking(
-                booking_uid=appointment.calcom_booking_uid,
-                new_start=req.new_start_time.isoformat(),
-                reason=req.reason,
-            )
 
             appointment.start_time = req.new_start_time
             appointment.end_time = new_end
@@ -239,7 +186,7 @@ class SchedulingService:
             confirmation_message=(
                 f"✅ Your appointment has been rescheduled!\n"
                 f"📅 New time: {req.new_start_time.strftime('%A, %B %d at %I:%M %p')} ({req.timezone})\n"
-                f"Ref: {appointment.calcom_booking_uid[:8].upper()}"
+                f"Ref: {appointment.calcom_booking_uid}"
             ),
         )
 
@@ -250,18 +197,12 @@ class SchedulingService:
         if not appointment:
             raise ValueError("Appointment not found")
 
-        # Authorization: verify phone matches
         customer = await self.db.get(Customer, appointment.customer_id)
         if customer.phone_number != req.customer_phone:
             raise PermissionError("Phone number does not match appointment record")
 
         if appointment.status == BookingStatus.CANCELLED:
             return {"status": "already_cancelled"}
-
-        await self.calcom.cancel_booking(
-            booking_uid=appointment.calcom_booking_uid,
-            reason=req.reason,
-        )
 
         appointment.status = BookingStatus.CANCELLED
         appointment.cancellation_reason = req.reason
@@ -275,7 +216,6 @@ class SchedulingService:
     # ─────────────────────────── Conflict check ──────────────────────────
 
     async def check_conflict(self, req: ConflictCheckRequest) -> ConflictCheckResponse:
-        """Explicit conflict check endpoint for n8n pre-validation."""
         has_conflict = await self._has_booking_conflict(
             req.staff_id, req.start_time, req.end_time, req.exclude_appointment_id
         )
@@ -293,10 +233,6 @@ class SchedulingService:
         end: datetime,
         exclude_id: Optional[UUID] = None,
     ) -> bool:
-        """
-        True if any confirmed/pending appointment for this staff overlaps [start, end).
-        Includes buffer times from the service.
-        """
         q = select(Appointment).where(
             and_(
                 Appointment.staff_id == staff_id,
@@ -308,7 +244,6 @@ class SchedulingService:
         )
         if exclude_id:
             q = q.where(Appointment.id != exclude_id)
-
         result = await self.db.execute(q)
         return result.scalars().first() is not None
 
@@ -332,17 +267,10 @@ class SchedulingService:
     async def _get_appointment(self, appointment_id: UUID) -> Optional[Appointment]:
         return await self.db.get(Appointment, appointment_id)
 
-    async def _get_staff_for_service(self, service_id: UUID, tenant_id: UUID) -> List[Staff]:
+    async def _get_active_staff(self, tenant_id: UUID) -> List[Staff]:
         result = await self.db.execute(
             select(Staff).where(
-                and_(
-                    Staff.tenant_id == tenant_id,
-                    Staff.is_active == True,
-                    func.jsonb_path_exists(
-                        Staff.specializations,
-                        f'$[*] ? (@ == "{service_id}")',
-                    ),
-                )
+                and_(Staff.tenant_id == tenant_id, Staff.is_active == True)
             )
         )
         return result.scalars().all()
