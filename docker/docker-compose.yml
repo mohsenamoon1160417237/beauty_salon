@@ -93,9 +93,9 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
       interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
+      timeout: 15s
+      retries: 10
+      start_period: 120s
 
   # ─── Python Booking API ────────────────────────────────────
   booking-api:
