@@ -17,7 +17,7 @@ from typing import List, Optional
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, and_, or_, func
+from sqlalchemy import select, and_, or_, func, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.redis_client import DistributedLock, slot_lock_key
@@ -233,10 +233,11 @@ class SchedulingService:
         end: datetime,
         exclude_id: Optional[UUID] = None,
     ) -> bool:
+        from sqlalchemy import text, literal_column
         q = select(Appointment).where(
             and_(
                 Appointment.staff_id == staff_id,
-                Appointment.status.in_([BookingStatus.CONFIRMED.value, BookingStatus.PENDING.value]),
+                Appointment.status.cast(String).in_(["confirmed", "pending"]),
                 or_(
                     and_(Appointment.start_time < end, Appointment.end_time > start),
                 ),
