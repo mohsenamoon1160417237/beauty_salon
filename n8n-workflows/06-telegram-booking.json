@@ -1,0 +1,228 @@
+{
+  "name": "06 - Telegram Booking Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": ["message"],
+        "additionalFields": {}
+      },
+      "id": "telegram-trigger",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300],
+      "webhookId": "telegram-booking-webhook",
+      "credentials": {
+        "telegramApi": {
+          "id": "telegram-cred",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const msg = $input.first().json;\nconst message = msg.message || msg.edited_message;\n\nif (!message || !message.text) {\n  return [];\n}\n\nreturn [{\n  json: {\n    chat_id: message.chat.id,\n    user_id: message.from.id,\n    username: message.from.username || message.from.first_name,\n    first_name: message.from.first_name,\n    last_name: message.from.last_name || '',\n    message_text: message.text,\n    message_id: message.message_id,\n    session_key: `telegram_${message.chat.id}`\n  }\n}];"
+      },
+      "id": "extract-message",
+      "name": "Extract Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "={{ $json.session_key }}",
+        "options": {}
+      },
+      "id": "get-session",
+      "name": "Get Conversation Session",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [680, 300],
+      "credentials": {
+        "redis": {
+          "id": "redis-cred",
+          "name": "Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const session = $input.first().json;\nconst prev = $('Extract Message').first().json;\n\nlet history = [];\ntry {\n  if (session && session.value) {\n    history = JSON.parse(session.value);\n  }\n} catch(e) {\n  history = [];\n}\n\nreturn [{\n  json: {\n    ...prev,\n    conversation_history: history\n  }\n}];"
+      },
+      "id": "prepare-context",
+      "name": "Prepare Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "agent": "conversationalAgent",
+        "promptType": "define",
+        "text": "={{ $json.message_text }}",
+        "options": {
+          "systemMessage": "You are a friendly AI booking assistant for Glamour Beauty Salon. You help customers book, reschedule, and cancel beauty appointments via Telegram.\n\nSalon services available:\n- Haircut (30 min, $45)\n- Hair Coloring (120 min, $120)\n- Hair Styling (60 min, $65)\n- Nail Services (45 min, $50)\n- Facial Treatment (60 min, $80)\n- Eyebrow Services (30 min, $25)\n- Makeup (60 min, $90)\n\nTenant ID: 00000000-0000-0000-0000-000000000001\n\nWhen booking:\n1. Ask for preferred service\n2. Ask for preferred date and time\n3. Check availability using the availability API\n4. Confirm booking details with customer\n5. Create the booking\n6. Send confirmation\n\nAlways be friendly, professional, and concise. Support multiple languages based on user's language.\n\nConversation history:\n={{ JSON.stringify($json.conversation_history) }}\n\nCustomer name: {{ $json.first_name }} {{ $json.last_name }}\nCustomer Telegram ID: {{ $json.user_id }}"
+        }
+      },
+      "id": "ai-agent",
+      "name": "AI Booking Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [1120, 300],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "model": "claude-haiku-4-5-20251001",
+        "options": {
+          "maxTokensToSample": 1024,
+          "temperature": 0.3
+        }
+      },
+      "id": "claude-model",
+      "name": "Claude Model",
+      "type": "@n8n/n8n-nodes-langchain.lmAnthropicChat",
+      "typeVersion": 1.3,
+      "position": [1120, 500],
+      "credentials": {
+        "anthropicApi": {
+          "id": "anthropic-cred",
+          "name": "Anthropic"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=http://booking-api:8000/api/v1/availability",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "tenant_id", "value": "00000000-0000-0000-0000-000000000001" },
+            { "name": "service_id", "value": "={{ $json.service_id }}" },
+            { "name": "date_from", "value": "={{ $json.date_from }}" },
+            { "name": "date_to", "value": "={{ $json.date_to }}" },
+            { "name": "timezone", "value": "=UTC" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "check-availability",
+      "name": "Check Availability",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 700]
+    },
+    {
+      "parameters": {
+        "url": "http://booking-api:8000/api/v1/book",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "tenant_id", "value": "00000000-0000-0000-0000-000000000001" },
+            { "name": "service_id", "value": "={{ $json.service_id }}" },
+            { "name": "staff_id", "value": "={{ $json.staff_id }}" },
+            { "name": "customer_phone", "value": "=tg_{{ $json.user_id }}" },
+            { "name": "customer_name", "value": "={{ $json.customer_name }}" },
+            { "name": "start_time", "value": "={{ $json.start_time }}" },
+            { "name": "timezone", "value": "=UTC" },
+            { "name": "language", "value": "=en" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "create-booking",
+      "name": "Create Booking",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 900]
+    },
+    {
+      "parameters": {
+        "jsCode": "const agentResponse = $('AI Booking Agent').first().json.output;\nconst context = $('Prepare Context').first().json;\n\nconst history = context.conversation_history || [];\nhistory.push({ role: 'user', content: context.message_text });\nhistory.push({ role: 'assistant', content: agentResponse });\n\n// Keep last 20 messages\nif (history.length > 20) history.splice(0, history.length - 20);\n\nreturn [{\n  json: {\n    session_key: context.session_key,\n    history: JSON.stringify(history),\n    chat_id: context.chat_id,\n    reply: agentResponse\n  }\n}];"
+      },
+      "id": "prepare-reply",
+      "name": "Prepare Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ $json.session_key }}",
+        "value": "={{ $json.history }}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 86400,
+        "options": {}
+      },
+      "id": "save-session",
+      "name": "Save Session",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1560, 300],
+      "credentials": {
+        "redis": {
+          "id": "redis-cred",
+          "name": "Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Prepare Reply').first().json.chat_id }}",
+        "text": "={{ $('Prepare Reply').first().json.reply }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "send-telegram-reply",
+      "name": "Send Telegram Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1780, 300],
+      "credentials": {
+        "telegramApi": {
+          "id": "telegram-cred",
+          "name": "Telegram Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [[{ "node": "Extract Message", "type": "main", "index": 0 }]]
+    },
+    "Extract Message": {
+      "main": [[{ "node": "Get Conversation Session", "type": "main", "index": 0 }]]
+    },
+    "Get Conversation Session": {
+      "main": [[{ "node": "Prepare Context", "type": "main", "index": 0 }]]
+    },
+    "Prepare Context": {
+      "main": [[{ "node": "AI Booking Agent", "type": "main", "index": 0 }]]
+    },
+    "AI Booking Agent": {
+      "main": [[{ "node": "Prepare Reply", "type": "main", "index": 0 }]]
+    },
+    "Claude Model": {
+      "ai_languageModel": [[{ "node": "AI Booking Agent", "type": "ai_languageModel", "index": 0 }]]
+    },
+    "Prepare Reply": {
+      "main": [[{ "node": "Save Session", "type": "main", "index": 0 }]]
+    },
+    "Save Session": {
+      "main": [[{ "node": "Send Telegram Reply", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2026-06-22T00:00:00.000Z",
+  "versionId": "1"
+}
